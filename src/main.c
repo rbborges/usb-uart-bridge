@@ -81,9 +81,7 @@ static void uart_cb(const struct device *dev, void *ctx)
         ret = uart_fifo_read(uart_ctx->rx_dev, &c, 1);
         while( ret > 0 ){
             if(uart_irq_update(uart_ctx->tx_dev) > 0){
-                // uart_poll_out(uart_ctx->tx_dev, c);
                 uart_fifo_fill(uart_ctx->tx_dev, &c, 1);
-                // printk("%c", c);
             }
             ret = uart_fifo_read(uart_ctx->rx_dev, &c, 1);
         }
