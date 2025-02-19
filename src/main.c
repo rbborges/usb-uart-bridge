@@ -66,15 +66,15 @@ int usb_console_init(){
 static void uart_cb(const struct device *dev, void *ctx)
 {
     struct uart_passthrough_data *uart_ctx = (struct uart_passthrough_data *)ctx;
-    int ret;
 
     while (uart_irq_update(uart_ctx->rx_dev) > 0) {
+        int ret;
         ret = uart_irq_rx_ready(uart_ctx->rx_dev);
         if (ret < 0) {
             uart_ctx->rx_error = true;
         }
         if (ret <= 0) {
-            break;
+            return;
         }
 
         uint8_t c;
@@ -91,7 +91,7 @@ static void uart_cb(const struct device *dev, void *ctx)
             uart_ctx->rx_error = true;
         }
         if (ret <= 0) {
-            break;
+            return;
         }
     }
 }
@@ -104,12 +104,6 @@ int main(void)
 
     LOG_INF("usb_console_init OK");
 
-    // if(uart_dev_init()){
-    //     return 0;
-    // }
-
-    // LOG_INF("usb_uart_bridge_dev_init OK");
-
     uart_irq_callback_user_data_set(usb_console.rx_dev, uart_cb, (void *)&usb_console);
     uart_irq_callback_user_data_set(uart.rx_dev,        uart_cb, (void *)&uart);
 
@@ -118,7 +112,6 @@ int main(void)
 
 
     while (1) {
-        // printk("Hello World! %s\n", CONFIG_ARCH);
         k_sleep(K_SECONDS(1));
     }
 }

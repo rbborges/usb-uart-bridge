@@ -3,5 +3,6 @@
         "usb_device.h": "c",
         "typeinfo": "cpp",
         "string": "cpp"
-    }
+    },
+    "sonarlint.pathToCompileCommands": "${workspaceFolder}/.pio/build/blackpill_f411ce/compile_commands.json"
 }
