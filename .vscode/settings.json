@@ -1,0 +1,7 @@
+{
+    "files.associations": {
+        "usb_device.h": "c",
+        "typeinfo": "cpp",
+        "string": "cpp"
+    }
+}
