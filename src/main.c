@@ -65,6 +65,8 @@ int usb_console_init(){
 
 static void uart_cb(const struct device *dev, void *ctx)
 {
+    ARG_UNUSED(dev);
+
     struct uart_passthrough_data *uart_ctx = (struct uart_passthrough_data *)ctx;
 
     while (uart_irq_update(uart_ctx->rx_dev) > 0) {
