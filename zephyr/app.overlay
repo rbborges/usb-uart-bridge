@@ -4,6 +4,8 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+#include <zephyr/dt-bindings/dma/stm32_dma.h>
+
 / {
 	chosen {
 		zephyr,console = &cdc_acm_uart0;
@@ -31,10 +33,32 @@
 };
 
 
+/*
+ * An idle UART line sits high. PB7 has no bias by default, so whenever nothing
+ * drives it -- peer in reset, powered down, or cable out -- it floats and noise
+ * reads as start bits, which surfaces as a slow trickle of framing errors.
+ */
+&usart1_rx_pb7 {
+    bias-pull-up;
+};
+
+&dma2 {
+    status = "okay";
+};
+
 &usart1 {
     status = "okay";
     current-speed = <1000000>;
     pinctrl-0 = <&usart1_tx_pb6 &usart1_rx_pb7>;
     pinctrl-names = "default";
+
+    /*
+     * At 1 Mbaud a byte lands every ~10 us and this USART has no RX FIFO, so
+     * interrupt-per-byte reception overruns whenever a longer ISR (USB) runs.
+     * DMA2 stream 2 channel 4 is USART1_RX, stream 7 channel 4 is USART1_TX.
+     */
+    dmas = <&dma2 2 4 STM32_DMA_PERIPH_RX STM32_DMA_FIFO_1_4>,
+           <&dma2 7 4 STM32_DMA_PERIPH_TX STM32_DMA_FIFO_1_4>;
+    dma-names = "rx", "tx";
 };
 
