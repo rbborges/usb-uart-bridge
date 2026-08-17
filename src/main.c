@@ -1,22 +1,29 @@
 /*
- * Copyright (c) 2016 Intel Corporation.
+ * Low-latency USB CDC-ACM <-> UART bridge.
+ *
+ * Both directions are buffered in ring buffers and moved by DMA (UART side) or
+ * bulk transfers (USB side). Nothing coalesces or waits on a timer: data is
+ * forwarded as soon as the receiving end signals it has some.
+ *
+ * The UART receives under DMA with an idle-line flush, so a short burst is
+ * handed on roughly one character time after the peer stops transmitting,
+ * while a continuous stream never risks an overrun.
  *
  * SPDX-License-Identifier: Apache-2.0
  */
 
 #include <zephyr/kernel.h>
-#include <zephyr/sys/printk.h>
 #include <zephyr/sys/ring_buffer.h>
 #include <zephyr/usb/usb_device.h>
 #include <zephyr/drivers/uart.h>
 #include <zephyr/logging/log.h>
 
-LOG_MODULE_REGISTER(usb_uart_bridge_main, LOG_LEVEL_INF);
+LOG_MODULE_REGISTER(usb_uart_bridge, LOG_LEVEL_INF);
 
 #define USB_DEV  DEVICE_DT_GET(DT_CHOSEN(zephyr_console))
 #define UART_DEV DEVICE_DT_GET(DT_ALIAS(uart_device))
 
-/* ~20 ms of buffering per direction at 1 Mbaud. */
+/* Buffering per direction. 2 KB is ~20 ms of slack at 1 Mbaud. */
 #define RING_SIZE 2048
 
 /* CDC ACM bulk endpoint size: what the USB side moves per interrupt. */
@@ -26,13 +33,13 @@ LOG_MODULE_REGISTER(usb_uart_bridge_main, LOG_LEVEL_INF);
 #define USB_RESUME 256
 
 /*
- * usart1 receives into these two buffers, ping-ponging under DMA.
+ * The UART receives into these two buffers, ping-ponging under DMA.
  *
- * The timeout must stay 0. A non-zero value makes the driver defer the flush of
- * a partially filled buffer to a k_work, which on a request/response protocol
- * adds that delay to every frame before it reaches USB. With 0 the driver
- * instead flushes straight from the USART IDLE-line interrupt, so a short frame
- * is forwarded about one character time after the peer stops transmitting.
+ * The timeout must stay 0. A non-zero value makes the driver defer the flush
+ * of a partially filled buffer to a k_work, adding that delay to every short
+ * frame. With 0 the driver flushes straight from the USART idle-line
+ * interrupt instead, which is what keeps the forwarding latency at the
+ * microsecond scale rather than the millisecond scale.
  */
 #define UART_RX_BUF_SIZE   256
 #define UART_RX_TIMEOUT_US 0
@@ -41,15 +48,16 @@ LOG_MODULE_REGISTER(usb_uart_bridge_main, LOG_LEVEL_INF);
 #define UART_TX_CHUNK 256
 
 /*
- * usart1 talks to a peer running at a fixed rate, so the devicetree
- * current-speed is authoritative and host SET_LINE_CODING requests are only
- * reported, never applied. This matters because the CDC ACM class resets its
- * line coding to 115200 on every USB reset -- following it would silently drag
- * usart1 off 1 Mbaud the moment the port is enumerated.
+ * Apply the line coding (baud rate, parity, data bits, stop bits) that the USB
+ * host requests, like any USB-serial adapter does. Set to 0 to pin the UART to
+ * the devicetree current-speed and ignore the host instead, which is useful
+ * when the attached peer runs at a fixed rate that must not be disturbed.
  *
- * Set to 1 to let the host retune the UART instead.
+ * Note that the CDC ACM class resets its line coding to 115200 on every USB
+ * reset, so with this enabled the UART follows suit until the host reopens the
+ * port and sets the rate it wants.
  */
-#define BRIDGE_FOLLOW_HOST_LINE_CODING 0
+#define BRIDGE_FOLLOW_HOST_LINE_CODING 1
 
 RING_BUF_DECLARE(usb_to_uart_rb, RING_SIZE);
 RING_BUF_DECLARE(uart_to_usb_rb, RING_SIZE);
@@ -63,171 +71,81 @@ struct dir_stats {
     uint32_t frame_errors; /* FE: usually a baud rate mismatch */
     uint32_t line_errors;  /* parity and noise */
     uint32_t tx_refused;   /* uart_tx() rejected a transmit outright */
+    uint32_t throttles;    /* times the source was paused for backpressure */
 
     uint32_t reported_dropped;
     uint32_t reported_overruns;
     uint32_t reported_frame_errors;
     uint32_t reported_line_errors;
     uint32_t reported_tx_refused;
+    uint32_t reported_throttles;
 };
 
 static struct dir_stats uart_to_usb_stats = { .name = "uart->usb" };
 static struct dir_stats usb_to_uart_stats = { .name = "usb->uart" };
 
+/*
+ * Forwarding latency: the time data waits in the bridge before being handed to
+ * the far side. It deliberately excludes the time the UART then spends
+ * serializing at wire rate, which is a property of the baud rate rather than
+ * of this firmware.
+ */
+static uint32_t u2h_since;   /* uart->usb: set when a ring goes non-empty */
+static bool u2h_pending;
+static uint32_t u2h_max;
+static uint32_t h2u_since;   /* usb->uart: set when a transmit becomes due */
+static bool h2u_pending;
+static uint32_t h2u_max;
+
 static uint8_t uart_rx_buf[2][UART_RX_BUF_SIZE];
 static uint8_t uart_rx_next;
 static bool uart_tx_busy;
+static bool usb_throttled;
 
 /*
- * Dwell diagnostics: the worst time data sat inside a ring during the report
- * window, and the deepest the ring got. A dwell opens when a ring goes
- * non-empty and closes when the bridge has handed everything onward (to the
- * UART DMA / to the CDC layer). If the bridge ever holds a frame for
- * milliseconds it shows up here; if these stay in microseconds while the far
- * ends time out, the delay is not in this firmware.
- *
- * dwell_end() must run with interrupts locked; dwell_begin() runs either in an
- * ISR or under the same lock. Window resets in the reporter are lock-free: a
- * clobbered sample is acceptable for diagnostics.
+ * RX health. The stm32 async driver has a path (DMA error -> UART_RX_STOPPED)
+ * that halts reception without ever raising UART_RX_DISABLED, so a restart
+ * keyed on RX_DISABLED alone can leave the bridge deaf with no indication.
+ * These let a watchdog in the main loop detect and break that state.
  */
-struct dwell_stats {
-    bool active;
-    uint32_t t_start;    /* k_cycle_get_32() at ring empty -> non-empty */
-    uint32_t max_cycles; /* worst dwell this window */
-    uint32_t hiwater;    /* deepest ring fill this window, bytes */
-    uint32_t over_1ms;   /* dwells that exceeded 1 ms, cumulative */
-};
+static volatile bool uart_rx_alive;
+static volatile bool uart_rx_stop_seen;
+static bool uart_rx_inhibit; /* a deliberate teardown is in progress */
+static uint32_t uart_rx_restarts;
+static uint32_t reported_rx_restarts;
+static int uart_rx_last_err;
 
-static struct dwell_stats usb_to_uart_dwell;
-static struct dwell_stats uart_to_usb_dwell;
-
-/* USB OUT throttling (host NAK) episodes: entered when usb_to_uart_rb fills. */
-static bool usb_throttled;
-static uint32_t usb_throttle_t0;
-static uint32_t usb_throttles;    /* episodes, cumulative */
-static uint32_t usb_throttle_max; /* longest episode this window, cycles */
-
-static void dwell_begin(struct dwell_stats *d, uint32_t queued)
-{
-    if (!d->active) {
-        d->active = true;
-        d->t_start = k_cycle_get_32();
-    }
-    if (queued > d->hiwater) {
-        d->hiwater = queued;
-    }
-}
-
-static void dwell_end(struct dwell_stats *d)
-{
-    if (d->active) {
-        uint32_t dt = k_cycle_get_32() - d->t_start;
-
-        d->active = false;
-        if (dt > d->max_cycles) {
-            d->max_cycles = dt;
-        }
-        if (k_cyc_to_us_floor32(dt) > 1000) {
-            d->over_1ms++;
-        }
-    }
-}
-
-int usb_console_init(){
-    uint32_t dtr = 0;
-
-    int ret = usb_enable(NULL);
-    if (ret) {
-        return ret;
-    }
-
-    /* Poll if the DTR flag was set */
-    while (!dtr) {
-        uart_line_ctrl_get(USB_DEV, UART_LINE_CTRL_DTR, &dtr);
-        /* Give CPU resources to low priority threads. */
-        k_sleep(K_MSEC(100));
-    }
-
-    return 0;
-}
+static K_SEM_DEFINE(uart_rx_off, 0, 1);
 
 static const uint8_t data_bits_n[]     = {5, 6, 7, 8, 9};
 static const char *const parity_s[]    = {"none", "odd", "even", "mark", "space"};
 static const char *const stop_bits_s[] = {"0.5", "1", "1.5", "2"};
-
-static bool uart_config_eq(const struct uart_config *a, const struct uart_config *b)
-{
-    return a->baudrate  == b->baudrate  &&
-           a->parity    == b->parity    &&
-           a->stop_bits == b->stop_bits &&
-           a->data_bits == b->data_bits &&
-           a->flow_ctrl == b->flow_ctrl;
-}
 
 static void uart_rx_start(void)
 {
     int ret = uart_rx_enable(UART_DEV, uart_rx_buf[0], UART_RX_BUF_SIZE,
                              UART_RX_TIMEOUT_US);
     if (ret) {
-        LOG_ERR("uart_rx_enable failed (%d)", ret);
+        uart_rx_alive = false;
+        /* Log once per failure mode; the watchdog retries every 100 ms. */
+        if (ret != uart_rx_last_err) {
+            LOG_ERR("uart_rx_enable failed (%d)", ret);
+        }
+        uart_rx_last_err = ret;
         return;
     }
 
+    if (uart_rx_last_err) {
+        LOG_INF("uart rx recovered");
+    }
+    uart_rx_last_err = 0;
     uart_rx_next = 1;
+    uart_rx_stop_seen = false;
+    uart_rx_alive = true;
 }
 
 /*
- * Reconcile the line coding the USB host asked for with the physical UART. The
- * legacy USB device stack does not report SET_LINE_CODING to the application,
- * so the CDC ACM device has to be polled for it.
- */
-static void uart_config_sync(struct uart_config *applied)
-{
-    struct uart_config cfg;
-
-    if (uart_config_get(USB_DEV, &cfg)) {
-        return;
-    }
-
-    /* usart1 has no RTS/CTS routed in the overlay. */
-    cfg.flow_ctrl = UART_CFG_FLOW_CTRL_NONE;
-
-    if (uart_config_eq(&cfg, applied)) {
-        return;
-    }
-
-#if !BRIDGE_FOLLOW_HOST_LINE_CODING
-    /* Report each distinct request once, so a mismatch is visible, then ignore. */
-    static struct uart_config refused;
-
-    if (!uart_config_eq(&cfg, &refused)) {
-        refused = cfg;
-        LOG_WRN("host asked for %u baud %u%s%s; keeping %u baud (devicetree)",
-                cfg.baudrate, data_bits_n[cfg.data_bits],
-                parity_s[cfg.parity], stop_bits_s[cfg.stop_bits],
-                applied->baudrate);
-    }
-#else
-    /* Reception must be torn down and restarted around a reconfigure. */
-    uart_rx_disable(UART_DEV);
-
-    int ret = uart_configure(UART_DEV, &cfg);
-    if (ret) {
-        LOG_WRN("uart_configure failed (%d), staying at %u baud",
-                ret, applied->baudrate);
-    } else {
-        *applied = cfg;
-        LOG_INF("uart config: %u baud, %u data bits, %s parity, %s stop bits",
-                cfg.baudrate, data_bits_n[cfg.data_bits],
-                parity_s[cfg.parity], stop_bits_s[cfg.stop_bits]);
-    }
-
-    uart_rx_start();
-#endif
-}
-
-/*
- * Start a DMA transmit on usart1 if one is not already in flight.
+ * Start a DMA transmit on the UART if one is not already in flight.
  *
  * The claim handed to uart_tx() stays outstanding until UART_TX_DONE, so the
  * DMA reads straight out of the ring with no intermediate copy.
@@ -242,10 +160,17 @@ static void uart_tx_kick(void)
 
         if (len == 0) {
             ring_buf_get_finish(&usb_to_uart_rb, 0);
-            /* Ring empty and nothing in flight: the direction is drained. */
-            dwell_end(&usb_to_uart_dwell);
         } else if (uart_tx(UART_DEV, data, len, SYS_FOREVER_US) == 0) {
             uart_tx_busy = true;
+
+            if (h2u_pending) {
+                uint32_t dt = k_cycle_get_32() - h2u_since;
+
+                h2u_pending = false;
+                if (dt > h2u_max) {
+                    h2u_max = dt;
+                }
+            }
         } else {
             ring_buf_get_finish(&usb_to_uart_rb, 0);
             usb_to_uart_stats.tx_refused++;
@@ -255,17 +180,8 @@ static void uart_tx_kick(void)
     irq_unlock(key);
 
     /* A completed transmit frees space; let a throttled host resume. */
-    if (ring_buf_space_get(&usb_to_uart_rb) >= USB_RESUME) {
-        key = irq_lock();
-        if (usb_throttled) {
-            usb_throttled = false;
-            uint32_t dt = k_cycle_get_32() - usb_throttle_t0;
-            if (dt > usb_throttle_max) {
-                usb_throttle_max = dt;
-            }
-        }
-        irq_unlock(key);
-
+    if (usb_throttled && ring_buf_space_get(&usb_to_uart_rb) >= USB_RESUME) {
+        usb_throttled = false;
         uart_irq_rx_enable(USB_DEV);
     }
 }
@@ -283,6 +199,12 @@ static void uart_tx_complete(uint32_t len)
 
     ring_buf_get_finish(&usb_to_uart_rb, len);
     uart_tx_busy = false;
+
+    /* More queued: the gap until the next uart_tx() is bridge-added time. */
+    if (!ring_buf_is_empty(&usb_to_uart_rb) && !h2u_pending) {
+        h2u_pending = true;
+        h2u_since = k_cycle_get_32();
+    }
 
     irq_unlock(key);
 
@@ -315,8 +237,13 @@ static void uart_async_cb(const struct device *dev, struct uart_event *evt, void
             uart_to_usb_stats.dropped += evt->data.rx.len - put;
         }
 
-        /* ISR context: safe against the workqueue-side dwell_end. */
-        dwell_begin(&uart_to_usb_dwell, ring_buf_size_get(&uart_to_usb_rb));
+        if (!u2h_pending) {
+            u2h_pending = true;
+            u2h_since = k_cycle_get_32();
+        }
+
+        /* Data still flowing: reception did not die with the last error. */
+        uart_rx_stop_seen = false;
 
         uart_irq_tx_enable(USB_DEV);
         break;
@@ -333,11 +260,19 @@ static void uart_async_cb(const struct device *dev, struct uart_event *evt, void
 
     case UART_RX_STOPPED:
         uart_note_errors(evt->data.rx_stop.reason);
+        /* May be the driver's dead-end DMA-error path; watchdog decides. */
+        uart_rx_stop_seen = true;
         break;
 
     case UART_RX_DISABLED:
-        /* Reception ended, including after an error; bring it back up. */
-        uart_rx_start();
+        uart_rx_alive = false;
+        if (uart_rx_inhibit) {
+            k_sem_give(&uart_rx_off);
+        } else {
+            /* Reception ended on its own, including after an error. */
+            uart_rx_restarts++;
+            uart_rx_start();
+        }
         break;
 
     case UART_TX_DONE:
@@ -368,21 +303,18 @@ static void usb_rx_to_ring(const struct device *dev)
     }
 
     unsigned int key = irq_lock();
-    dwell_begin(&usb_to_uart_dwell, ring_buf_size_get(&usb_to_uart_rb));
+    if (!uart_tx_busy && !h2u_pending) {
+        h2u_pending = true;
+        h2u_since = k_cycle_get_32();
+    }
     irq_unlock(key);
 
     uart_tx_kick();
 
     if (ring_buf_space_get(&usb_to_uart_rb) == 0) {
-        key = irq_lock();
-        if (!usb_throttled) {
-            usb_throttled = true;
-            usb_throttle_t0 = k_cycle_get_32();
-            usb_throttles++;
-        }
-        irq_unlock(key);
-
         /* NAK the host until the UART drains what we already hold. */
+        usb_throttled = true;
+        usb_to_uart_stats.throttles++;
         uart_irq_rx_disable(dev);
     }
 }
@@ -394,18 +326,21 @@ static void usb_tx_from_ring(const struct device *dev)
 
     if (claimed == 0) {
         ring_buf_get_finish(&uart_to_usb_rb, 0);
-
-        /* Everything received so far has been handed to the CDC layer. */
-        unsigned int key = irq_lock();
-        dwell_end(&uart_to_usb_dwell);
-        irq_unlock(key);
-
         uart_irq_tx_disable(dev);
         return;
     }
 
     int sent = uart_fifo_fill(dev, data, claimed);
     ring_buf_get_finish(&uart_to_usb_rb, sent > 0 ? sent : 0);
+
+    if (sent > 0 && u2h_pending && ring_buf_is_empty(&uart_to_usb_rb)) {
+        uint32_t dt = k_cycle_get_32() - u2h_since;
+
+        u2h_pending = false;
+        if (dt > u2h_max) {
+            u2h_max = dt;
+        }
+    }
 }
 
 static void usb_isr(const struct device *dev, void *ctx)
@@ -422,12 +357,97 @@ static void usb_isr(const struct device *dev, void *ctx)
     }
 }
 
-/* Log counter movement, distinguishing where the bytes were lost. */
+static bool uart_config_eq(const struct uart_config *a, const struct uart_config *b)
+{
+    return a->baudrate  == b->baudrate  &&
+           a->parity    == b->parity    &&
+           a->stop_bits == b->stop_bits &&
+           a->data_bits == b->data_bits &&
+           a->flow_ctrl == b->flow_ctrl;
+}
+
+/*
+ * Reconcile the line coding the USB host asked for with the UART. The legacy
+ * USB device stack does not report SET_LINE_CODING to the application, so the
+ * CDC ACM device has to be polled for it.
+ */
+static void uart_config_sync(struct uart_config *applied)
+{
+    struct uart_config cfg;
+
+    if (uart_config_get(USB_DEV, &cfg)) {
+        return;
+    }
+
+    /* Hardware flow control needs RTS/CTS pins, which are not routed. */
+    cfg.flow_ctrl = UART_CFG_FLOW_CTRL_NONE;
+
+    if (uart_config_eq(&cfg, applied)) {
+        return;
+    }
+
+#if !BRIDGE_FOLLOW_HOST_LINE_CODING
+    /* Report each distinct request once, so a mismatch is visible, then ignore. */
+    static struct uart_config refused;
+
+    if (!uart_config_eq(&cfg, &refused)) {
+        refused = cfg;
+        LOG_WRN("host asked for %u baud; keeping %u baud (devicetree)",
+                cfg.baudrate, applied->baudrate);
+    }
+#else
+    /* Tear reception down around the reconfigure without the auto-restart. */
+    uart_rx_inhibit = true;
+    k_sem_reset(&uart_rx_off);
+    if (uart_rx_disable(UART_DEV) == 0) {
+        k_sem_take(&uart_rx_off, K_MSEC(50));
+    }
+
+    int ret = uart_configure(UART_DEV, &cfg);
+    if (ret) {
+        LOG_WRN("uart_configure failed (%d), staying at %u baud",
+                ret, applied->baudrate);
+    } else {
+        *applied = cfg;
+        LOG_INF("uart: %u baud, %u data bits, %s parity, %s stop bits",
+                cfg.baudrate, data_bits_n[cfg.data_bits],
+                parity_s[cfg.parity], stop_bits_s[cfg.stop_bits]);
+    }
+
+    uart_rx_inhibit = false;
+    uart_rx_start();
+#endif
+}
+
+/*
+ * Runs every 100 ms. Recovers reception from the two states the event handlers
+ * cannot: a dead DMA (RX_STOPPED never followed by RX_DISABLED) and a failed
+ * uart_rx_enable(), at boot or during a restart.
+ */
+static void uart_rx_watchdog(void)
+{
+    if (uart_rx_alive && uart_rx_stop_seen) {
+        uart_rx_stop_seen = false;
+        /* Tear down properly; RX_DISABLED will trigger the restart. */
+        if (uart_rx_disable(UART_DEV) != 0) {
+            uart_rx_alive = false;
+        }
+    } else if (!uart_rx_alive) {
+        uart_rx_restarts++;
+        uart_rx_start();
+    }
+
+    if (uart_rx_restarts != reported_rx_restarts) {
+        LOG_WRN("uart rx restarted (%u total, last err %d)",
+                uart_rx_restarts, uart_rx_last_err);
+        reported_rx_restarts = uart_rx_restarts;
+    }
+}
+
 static void stats_report(struct dir_stats *s)
 {
     if (s->dropped != s->reported_dropped) {
-        LOG_WRN("%s: %u bytes dropped (ring full, destination stalled)",
-                s->name, s->dropped);
+        LOG_WRN("%s: %u bytes dropped (buffer full)", s->name, s->dropped);
         s->reported_dropped = s->dropped;
     }
     if (s->overruns != s->reported_overruns) {
@@ -449,45 +469,35 @@ static void stats_report(struct dir_stats *s)
         LOG_WRN("%s: %u refused transmits", s->name, s->tx_refused);
         s->reported_tx_refused = s->tx_refused;
     }
+    if (s->throttles != s->reported_throttles) {
+        LOG_WRN("%s: %u backpressure pauses (peer slower than source)",
+                s->name, s->throttles);
+        s->reported_throttles = s->throttles;
+    }
 }
 
-/*
- * Once a second: worst in-bridge latency per direction over the last window.
- * Lock-free window resets; a clobbered sample costs one report, not data.
- */
-static void dwell_report(void)
+/* Once a second: worst forwarding latency per direction over the last window. */
+static void latency_report(void)
 {
-    uint32_t a  = usb_to_uart_dwell.max_cycles;
-    uint32_t ah = usb_to_uart_dwell.hiwater;
-    uint32_t b  = uart_to_usb_dwell.max_cycles;
-    uint32_t bh = uart_to_usb_dwell.hiwater;
-    uint32_t th = usb_throttle_max;
+    uint32_t a = h2u_max;
+    uint32_t b = u2h_max;
 
-    usb_to_uart_dwell.max_cycles = 0;
-    usb_to_uart_dwell.hiwater = 0;
-    uart_to_usb_dwell.max_cycles = 0;
-    uart_to_usb_dwell.hiwater = 0;
-    usb_throttle_max = 0;
+    h2u_max = 0;
+    u2h_max = 0;
 
     if (a || b) {
-        LOG_INF("dwell max: usb->uart %u us (peak %u B), uart->usb %u us (peak %u B), >1ms %u/%u",
-                k_cyc_to_us_floor32(a), ah,
-                k_cyc_to_us_floor32(b), bh,
-                usb_to_uart_dwell.over_1ms, uart_to_usb_dwell.over_1ms);
-    }
-    if (th) {
-        LOG_WRN("usb rx throttled: %u episodes total, longest this window %u us",
-                usb_throttles, k_cyc_to_us_floor32(th));
+        LOG_INF("forwarding latency: usb->uart %u us, uart->usb %u us",
+                k_cyc_to_us_floor32(a), k_cyc_to_us_floor32(b));
     }
 }
 
 int main(void)
 {
-    if(usb_console_init()){
+    int ret = usb_enable(NULL);
+    if (ret) {
+        LOG_ERR("usb_enable failed (%d)", ret);
         return 0;
     }
-
-    LOG_INF("usb_console_init OK");
 
     struct uart_config applied;
     if (uart_config_get(UART_DEV, &applied)) {
@@ -495,7 +505,7 @@ int main(void)
         return 0;
     }
 
-    int ret = uart_callback_set(UART_DEV, uart_async_cb, NULL);
+    ret = uart_callback_set(UART_DEV, uart_async_cb, NULL);
     if (ret) {
         LOG_ERR("uart_callback_set failed (%d)", ret);
         return 0;
@@ -506,23 +516,19 @@ int main(void)
     uart_rx_start();
     uart_irq_rx_enable(USB_DEV);
 
+    LOG_INF("bridge up: %u baud, dma rx %u B x2, %u B buffers",
+            applied.baudrate, UART_RX_BUF_SIZE, RING_SIZE);
+
     struct dir_stats *const stats[] = { &usb_to_uart_stats, &uart_to_usb_stats };
     unsigned int tick = 0;
 
     while (1) {
         if (++tick >= 10) {
             tick = 0;
-            dwell_report();
+            latency_report();
         }
 
-        /*
-         * Backstop. Transmits are normally chained from UART_TX_DONE, but if
-         * uart_tx() were ever refused the claim is dropped and nothing would
-         * re-arm until the next byte arrived from USB. This bounds that to one
-         * poll interval instead of stranding the data indefinitely.
-         */
-        uart_tx_kick();
-
+        uart_rx_watchdog();
         uart_config_sync(&applied);
 
         for (size_t i = 0; i < ARRAY_SIZE(stats); i++) {

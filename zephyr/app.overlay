@@ -48,6 +48,8 @@
 
 &usart1 {
     status = "okay";
+    /* Boot default only: the host's SET_LINE_CODING takes over once the port
+     * is opened, unless BRIDGE_FOLLOW_HOST_LINE_CODING is turned off. */
     current-speed = <1000000>;
     pinctrl-0 = <&usart1_tx_pb6 &usart1_rx_pb7>;
     pinctrl-names = "default";
