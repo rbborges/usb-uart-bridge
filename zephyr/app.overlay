@@ -58,8 +58,15 @@
      * At 1 Mbaud a byte lands every ~10 us and this USART has no RX FIFO, so
      * interrupt-per-byte reception overruns whenever a longer ISR (USB) runs.
      * DMA2 stream 2 channel 4 is USART1_RX, stream 7 channel 4 is USART1_TX.
+     *
+     * RX is cyclic on purpose. Otherwise the driver ping-pongs between two
+     * buffers, and uart_stm32_dma_replace_buffer() reloads the stream and
+     * clears the IDLE flag around the switch; a byte arriving in that window
+     * goes unreported until the next RX_RDY, so on a request/response protocol
+     * one byte per buffer disappears until the peer speaks again. Cyclic mode
+     * never switches buffers, so that path is never reached.
      */
-    dmas = <&dma2 2 4 STM32_DMA_PERIPH_RX STM32_DMA_FIFO_1_4>,
+    dmas = <&dma2 2 4 (STM32_DMA_PERIPH_RX | STM32_DMA_MODE_CYCLIC) STM32_DMA_FIFO_1_4>,
            <&dma2 7 4 STM32_DMA_PERIPH_TX STM32_DMA_FIFO_1_4>;
     dma-names = "rx", "tx";
 };
