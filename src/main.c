@@ -41,7 +41,9 @@ LOG_MODULE_REGISTER(usb_uart_bridge, LOG_LEVEL_INF);
  * interrupt instead, which is what keeps the forwarding latency at the
  * microsecond scale rather than the millisecond scale.
  */
-#define UART_RX_BUF_SIZE   256
+/* DIAGNOSTIC: temporarily 64 (normally 256) to confirm that the lost
+ * byte is tied to the DMA buffer switch. Revert to 256 afterwards. */
+#define UART_RX_BUF_SIZE   64
 #define UART_RX_TIMEOUT_US 0
 
 /* Upper bound on a single DMA transmit; the ring may hand back less. */
