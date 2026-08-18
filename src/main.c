@@ -105,6 +105,14 @@ static bool uart_tx_busy;
 static bool usb_throttled;
 
 /*
+ * Set when uart_tx() is refused. The stm32 driver can fail a transmit with its
+ * DMA stream still marked busy and never clear that by itself, so every later
+ * transmit fails the same way and the direction stays dead with data piling up
+ * in the ring. A watchdog forces the teardown the driver skipped.
+ */
+static volatile bool uart_tx_stuck;
+
+/*
  * RX health. The stm32 async driver has a path (DMA error -> UART_RX_STOPPED)
  * that halts reception without ever raising UART_RX_DISABLED, so a restart
  * keyed on RX_DISABLED alone can leave the bridge deaf with no indication.
@@ -176,6 +184,7 @@ static void uart_tx_kick(void)
         } else {
             ring_buf_get_finish(&usb_to_uart_rb, 0);
             usb_to_uart_stats.tx_refused++;
+            uart_tx_stuck = true;
         }
     }
 
@@ -188,12 +197,29 @@ static void uart_tx_kick(void)
     }
 }
 
+/* Restart the flow from a thread, never from the driver's own callback. */
+static void uart_tx_pump(struct k_work *work)
+{
+    ARG_UNUSED(work);
+    uart_tx_kick();
+}
+
+static K_WORK_DEFINE(uart_tx_work, uart_tx_pump);
+
 /*
  * Release the finished transfer's claim and start the next one.
  *
  * The release and the flag clear share the lock: uart_tx_busy is what stops a
  * concurrent uart_tx_kick() from issuing a second claim on this ring, so it
  * must not become visible before ring_buf_get_finish() has run.
+ *
+ * The next transmit is deferred to a work item rather than started here. This
+ * runs from the driver's UART_TX_DONE callback, which is reached from the DMA
+ * completion path before the driver has released the stream, so a uart_tx()
+ * issued from here is refused with -EBUSY and wedges the direction. Only a
+ * continuation of an already-running burst pays the work-queue hop; the first
+ * transmit of a burst still goes straight out from the USB interrupt, so short
+ * frames keep their latency.
  */
 static void uart_tx_complete(uint32_t len)
 {
@@ -210,7 +236,7 @@ static void uart_tx_complete(uint32_t len)
 
     irq_unlock(key);
 
-    uart_tx_kick();
+    k_work_submit(&uart_tx_work);
 }
 
 static void uart_note_errors(uint32_t reason)
@@ -446,6 +472,38 @@ static void uart_rx_watchdog(void)
     }
 }
 
+/*
+ * Runs every 100 ms. Recovers the one state uart_tx_kick() cannot: a transmit
+ * refused because the driver left its DMA stream busy. Nothing retries on its
+ * own, so without this the usb->uart direction never comes back. uart_tx_abort()
+ * forces the driver to release the stream; any resulting UART_TX_ABORTED runs
+ * uart_tx_complete() and restarts the flow, and if none arrives the kick here
+ * does it instead.
+ */
+static void uart_tx_watchdog(void)
+{
+    if (!uart_tx_stuck) {
+        return;
+    }
+    uart_tx_stuck = false;
+
+    if (uart_tx_busy || ring_buf_is_empty(&usb_to_uart_rb)) {
+        return;
+    }
+
+    /* Once only: stats_report() already tracks the refusal count, and the
+     * watchdog retries at 10 Hz for as long as the condition lasts. */
+    static bool announced;
+
+    if (!announced) {
+        announced = true;
+        LOG_WRN("usb->uart: forcing dma teardown after a refused transmit");
+    }
+
+    (void)uart_tx_abort(UART_DEV);
+    uart_tx_kick();
+}
+
 static void stats_report(struct dir_stats *s)
 {
     if (s->dropped != s->reported_dropped) {
@@ -531,6 +589,7 @@ int main(void)
         }
 
         uart_rx_watchdog();
+        uart_tx_watchdog();
         uart_config_sync(&applied);
 
         for (size_t i = 0; i < ARRAY_SIZE(stats); i++) {
