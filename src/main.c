@@ -12,6 +12,8 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+#include <string.h>
+
 #include <zephyr/kernel.h>
 #include <zephyr/sys/ring_buffer.h>
 #include <zephyr/usb/usb_device.h>
@@ -111,6 +113,18 @@ static bool uart_tx_busy;
 static bool usb_throttled;
 
 /*
+ * Bytes staged for the UART. The ring is drained into this buffer instead of
+ * being transmitted in place. A claim that lands on the ring's wrap point
+ * comes back short, which splits one frame into two back-to-back uart_tx()
+ * calls, and that is both where bytes come out corrupted and the same path
+ * that once left the DMA stream wedged. The copy costs roughly a microsecond
+ * per 256 bytes against 2.5 ms of wire time at 1 Mbaud, so the zero-copy claim
+ * it replaces was not buying anything measurable.
+ */
+static uint8_t uart_tx_buf[UART_TX_CHUNK];
+static uint32_t uart_tx_len;
+
+/*
  * Set when uart_tx() is refused. The stm32 driver can fail a transmit with its
  * DMA stream still marked busy and never clear that by itself, so every later
  * transmit fails the same way and the direction stays dead with data piling up
@@ -163,20 +177,23 @@ static void uart_rx_start(void)
 /*
  * Start a DMA transmit on the UART if one is not already in flight.
  *
- * The claim handed to uart_tx() stays outstanding until UART_TX_DONE, so the
- * DMA reads straight out of the ring with no intermediate copy.
+ * Anything already staged is retransmitted before new bytes are taken from the
+ * ring, so a refused transmit cannot lose data that has left the ring.
  */
 static void uart_tx_kick(void)
 {
     unsigned int key = irq_lock();
 
     if (!uart_tx_busy) {
-        uint8_t *data;
-        uint32_t len = ring_buf_get_claim(&usb_to_uart_rb, &data, UART_TX_CHUNK);
+        if (uart_tx_len == 0) {
+            uart_tx_len = ring_buf_get(&usb_to_uart_rb, uart_tx_buf,
+                                       sizeof(uart_tx_buf));
+        }
 
-        if (len == 0) {
-            ring_buf_get_finish(&usb_to_uart_rb, 0);
-        } else if (uart_tx(UART_DEV, data, len, SYS_FOREVER_US) == 0) {
+        if (uart_tx_len == 0) {
+            /* nothing staged and nothing queued */
+        } else if (uart_tx(UART_DEV, uart_tx_buf, uart_tx_len,
+                           SYS_FOREVER_US) == 0) {
             uart_tx_busy = true;
 
             if (h2u_pending) {
@@ -188,7 +205,7 @@ static void uart_tx_kick(void)
                 }
             }
         } else {
-            ring_buf_get_finish(&usb_to_uart_rb, 0);
+            /* The bytes stay staged for the watchdog to retry. */
             usb_to_uart_stats.tx_refused++;
             uart_tx_stuck = true;
         }
@@ -213,11 +230,11 @@ static void uart_tx_pump(struct k_work *work)
 static K_WORK_DEFINE(uart_tx_work, uart_tx_pump);
 
 /*
- * Release the finished transfer's claim and start the next one.
+ * Retire the finished transfer and start the next one.
  *
- * The release and the flag clear share the lock: uart_tx_busy is what stops a
- * concurrent uart_tx_kick() from issuing a second claim on this ring, so it
- * must not become visible before ring_buf_get_finish() has run.
+ * The staged length and the flag clear share the lock: uart_tx_busy is what
+ * stops a concurrent uart_tx_kick() from restaging on top of a transfer that
+ * is still in flight, so it must not become visible first.
  *
  * The next transmit is deferred to a work item rather than started here. This
  * runs from the driver's UART_TX_DONE callback, which is reached from the DMA
@@ -231,11 +248,17 @@ static void uart_tx_complete(uint32_t len)
 {
     unsigned int key = irq_lock();
 
-    ring_buf_get_finish(&usb_to_uart_rb, len);
+    if (len >= uart_tx_len) {
+        uart_tx_len = 0;
+    } else {
+        /* Aborted part way through: keep the tail for the next transmit. */
+        uart_tx_len -= len;
+        memmove(uart_tx_buf, uart_tx_buf + len, uart_tx_len);
+    }
     uart_tx_busy = false;
 
     /* More queued: the gap until the next uart_tx() is bridge-added time. */
-    if (!ring_buf_is_empty(&usb_to_uart_rb) && !h2u_pending) {
+    if ((uart_tx_len || !ring_buf_is_empty(&usb_to_uart_rb)) && !h2u_pending) {
         h2u_pending = true;
         h2u_since = k_cycle_get_32();
     }
@@ -493,7 +516,8 @@ static void uart_tx_watchdog(void)
     }
     uart_tx_stuck = false;
 
-    if (uart_tx_busy || ring_buf_is_empty(&usb_to_uart_rb)) {
+    if (uart_tx_busy || (uart_tx_len == 0 &&
+                         ring_buf_is_empty(&usb_to_uart_rb))) {
         return;
     }
 
