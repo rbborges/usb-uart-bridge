@@ -209,6 +209,15 @@ def report_failures(failures, late_arrivals, size, total, dump):
     if late_arrivals:
         print("    stale bytes were waiting before %d later exchanges wrote"
               % len(late_arrivals))
+        # An exchange that succeeded but found bytes already queued means the
+        # bridge produced more than it was asked for. Naming them says whether
+        # it is a duplicated reply or something else entirely; with size 1 the
+        # attribution is a guess, since any byte decodes as a valid reply.
+        for idx, blob in late_arrivals[:dump]:
+            print("      before #%-6d %2d B  %-28s %s"
+                  % (idx, len(blob), hexdump(blob), attribute(blob, size)))
+        if len(late_arrivals) > dump:
+            print("      ... %d more" % (len(late_arrivals) - dump))
 
     if len(failures) > 1:
         gaps = [failures[i].index - failures[i - 1].index
@@ -247,6 +256,11 @@ def histogram(samples_us, bins=12, width=48):
         bar = "#" * int(width * c / peak)
         out.append("  %8.1f us | %-*s %d" % (edge, width, bar, c))
     return out
+
+
+def hexdump(payload, limit=12):
+    h = payload[:limit].hex(" ")
+    return h + (" ..." if len(payload) > limit else "")
 
 
 def pct(sorted_vals, p):
