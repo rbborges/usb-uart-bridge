@@ -28,13 +28,6 @@ LOG_MODULE_REGISTER(usb_uart_bridge, LOG_LEVEL_INF);
 /* Buffering per direction. 2 KB is ~20 ms of slack at 1 Mbaud. */
 #define RING_SIZE 2048
 
-/*
- * DIAGNOSTIC: the two rings are deliberately different sizes so that the
- * period of a wrap-related fault says which ring it belongs to. Corruption
- * every 2048 bytes of traffic is usb->uart; every 1024 is uart->usb. Set this
- * back to RING_SIZE once that is known.
- */
-#define UART_TO_USB_RING_SIZE 1024
 
 /* CDC ACM bulk endpoint size: what the USB side moves per interrupt. */
 #define USB_CHUNK 64
@@ -70,7 +63,7 @@ LOG_MODULE_REGISTER(usb_uart_bridge, LOG_LEVEL_INF);
 #define BRIDGE_FOLLOW_HOST_LINE_CODING 1
 
 RING_BUF_DECLARE(usb_to_uart_rb, RING_SIZE);
-RING_BUF_DECLARE(uart_to_usb_rb, UART_TO_USB_RING_SIZE);
+RING_BUF_DECLARE(uart_to_usb_rb, RING_SIZE);
 
 /* Counters are written from interrupt context and reported from main(). */
 struct dir_stats {
@@ -606,8 +599,8 @@ int main(void)
     uart_rx_start();
     uart_irq_rx_enable(USB_DEV);
 
-    LOG_INF("bridge up: %u baud, dma rx %u B, rings %u B usb->uart, %u B uart->usb",
-            applied.baudrate, UART_RX_BUF_SIZE, RING_SIZE, UART_TO_USB_RING_SIZE);
+    LOG_INF("bridge up: %u baud, dma rx %u B cyclic, %u B rings",
+            applied.baudrate, UART_RX_BUF_SIZE, RING_SIZE);
 
     struct dir_stats *const stats[] = { &usb_to_uart_stats, &uart_to_usb_stats };
     unsigned int tick = 0;

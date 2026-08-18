@@ -37,8 +37,16 @@ except ImportError:
 
 
 def wire_time_us(nbytes, baud, bits_per_byte=10):
-    """Time to serialize nbytes in each direction, in microseconds."""
-    return 2.0 * nbytes * bits_per_byte / baud * 1e6
+    """Floor on the loopback round trip imposed by the wire, in microseconds.
+
+    One serialisation time, not two. TX and RX are the same wire here, so a
+    byte is received the instant it is sent and the bridge forwards it while
+    the rest of the payload is still going out. The last byte cannot return
+    before it has been transmitted, which is the real floor; counting the
+    return leg separately would assume the bridge waits for a whole frame
+    before forwarding, which is exactly what this firmware avoids doing.
+    """
+    return nbytes * bits_per_byte / baud * 1e6
 
 
 def roundtrip(ser, payload):
@@ -262,7 +270,7 @@ def report(size, baud, lat, nerrors, show_hist):
     print("  p99  %9.1f us" % pct(s, 0.99))
     print("  max  %9.1f us" % s[-1])
     print("  jitter (p99 - min) %.1f us" % (pct(s, 0.99) - s[0]))
-    print("  overhead beyond wire time (p50): %.1f us" % (pct(s, 0.50) - wire))
+    print("  overhead above the wire floor (p50): %.1f us" % (pct(s, 0.50) - wire))
     if show_hist:
         print("  distribution:")
         for line in histogram(s):
